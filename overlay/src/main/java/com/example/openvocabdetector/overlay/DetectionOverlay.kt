@@ -22,7 +22,8 @@ import com.example.openvocabdetector.detection.FrameResult
 fun DetectionOverlay(
     frameResult: FrameResult?,
     labels: List<String>,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    scaleType: ViewportTransform.ScaleType = ViewportTransform.ScaleType.FILL_CENTER
 ) {
     if (frameResult == null) return
 
@@ -30,7 +31,6 @@ fun DetectionOverlay(
     val strokeWidth = with(density) { 1.5.dp.toPx() }
     val textSize = with(density) { 9.sp.toPx() }
     
-    // Fixed palette of 12 hues
     val palette = remember {
         List(12) { i ->
             Color.hsv(i * 30f, 0.8f, 0.9f)
@@ -52,21 +52,30 @@ fun DetectionOverlay(
         val viewWidth = size.width
         val viewHeight = size.height
 
+        // Calculate transform once per frame
+        val transform = ViewportTransform(
+            sourceWidth = frameResult.sourceWidth,
+            sourceHeight = frameResult.sourceHeight,
+            viewWidth = viewWidth,
+            viewHeight = viewHeight,
+            scaleType = scaleType
+        )
+
         frameResult.detections.forEach { detection ->
             val color = palette[detection.labelIndex % palette.size]
-            val rect = detection.box
             
-            // source (normalized 0..1) -> view coordinates
-            val left = rect.left * viewWidth
-            val top = rect.top * viewHeight
-            val right = rect.right * viewWidth
-            val bottom = rect.bottom * viewHeight
+            // Transform normalized source coordinates to View coordinates
+            val transformedRect = transform.transform(
+                detection.box, 
+                frameResult.sourceWidth, 
+                frameResult.sourceHeight
+            )
             
             // Draw Box
             drawRect(
                 color = color,
-                topLeft = Offset(left, top),
-                size = Size(right - left, bottom - top),
+                topLeft = Offset(transformedRect.left, transformedRect.top),
+                size = Size(transformedRect.width(), transformedRect.height()),
                 style = Stroke(width = strokeWidth)
             )
 
@@ -80,18 +89,18 @@ fun DetectionOverlay(
             val labelWidth = textBounds.width().toFloat() + 8f
             val labelHeight = textBounds.height().toFloat() + 4f
             
-            // Label Background
+            // Label Background (drawn above the box)
             drawRect(
                 color = color.copy(alpha = 0.7f),
-                topLeft = Offset(left, top - labelHeight),
+                topLeft = Offset(transformedRect.left, transformedRect.top - labelHeight),
                 size = Size(labelWidth, labelHeight)
             )
             
             // Label Text
             drawContext.canvas.nativeCanvas.drawText(
                 fullLabel,
-                left + 4f,
-                top - 4f,
+                transformedRect.left + 4f,
+                transformedRect.top - 4f,
                 textPaint
             )
         }

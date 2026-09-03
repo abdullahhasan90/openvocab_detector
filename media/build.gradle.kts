@@ -26,5 +26,6 @@ kotlin {
 }
 
 dependencies {
+    implementation(project(":detection"))
     implementation(libs.androidx.core.ktx)
 }

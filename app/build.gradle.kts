@@ -32,6 +32,9 @@ android {
     buildFeatures {
         compose = true
     }
+    androidResources {
+        noCompress += "tflite"
+    }
 }
 
 kotlin {
@@ -59,9 +62,14 @@ dependencies {
     implementation(libs.androidx.camera.camera2)
     implementation(libs.androidx.camera.lifecycle)
     implementation(libs.androidx.camera.view)
+    implementation(libs.androidx.camera.video)
 
     // Coroutines
     implementation(libs.kotlinx.coroutines.android)
+
+    // Media3
+    implementation(libs.androidx.media3.exoplayer)
+    implementation(libs.androidx.media3.ui)
 
     // TFLite with exclusion to avoid conflict with LiteRT
     implementation(libs.tflite.task.vision) {
