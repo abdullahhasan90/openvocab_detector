@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
 import android.util.Log
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -106,13 +107,14 @@ fun MainContent() {
     var isPlaying by remember { mutableStateOf(false) }
 
     // ML & Media
-    val detector = remember { EfficientDetLiteDetector(context) }
+    val detector = remember { YoloWorldDetector(context) }
     val videoProcessor = remember { VideoProcessor(detector) }
     val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
     
     // Safety flag to stop live inference when processing/playing
-    val isAnalysisActive = remember(isProcessing, isPlaying) {
-        !isProcessing && !isPlaying
+    // Use derivedStateOf and read .value in the analyzer to ensure fresh state
+    val isAnalysisActive = remember { 
+        derivedStateOf { !isProcessing && !isPlaying } 
     }
 
     DisposableEffect(Unit) {
@@ -141,7 +143,7 @@ fun MainContent() {
             .build()
             .also { analysis ->
                 analysis.setAnalyzer(analysisExecutor) { imageProxy ->
-                    if (!isAnalysisActive) {
+                    if (!isAnalysisActive.value) {
                         imageProxy.close()
                         return@setAnalyzer
                     }
@@ -190,6 +192,7 @@ fun MainContent() {
                 PlaybackView(
                     videoUri = lastVideoUri!!,
                     results = processingResults!!,
+                    labels = detector.labels,
                     onClose = { isPlaying = false }
                 )
             } else {
@@ -235,8 +238,14 @@ fun MainContent() {
                         }
                     },
                     hasVideo = lastVideoUri != null,
+                    isProcessing = isProcessing,
                     onProcess = {
-                        if (lastVideoUri != null) {
+                        if (lastVideoUri != null && !isProcessing) {
+                            Log.d("MainContent", "Starting video processing for: $lastVideoUri")
+                            Toast.makeText(context, "Processing started...", Toast.LENGTH_SHORT).show()
+                            frameResult = null // Clear live boxes immediately
+                            processingResults = null
+                            processingProgress = 0f
                             isProcessing = true
                         }
                     },
@@ -263,16 +272,27 @@ fun MainContent() {
     // Processing trigger
     LaunchedEffect(isProcessing) {
         if (isProcessing && lastVideoUri != null) {
+            // Wait for the video file to be finalized by the OS
+            delay(500)
+            
             videoProcessor.processVideo(context, lastVideoUri!!).collect { status ->
                 when (status) {
-                    is ProcessingStatus.Progress -> processingProgress = status.progress
+                    is ProcessingStatus.Progress -> {
+                        processingProgress = status.progress
+                        if (((status.progress * 100).toInt() % 10) == 0) {
+                            Log.d("MainContent", "Processing progress: ${(status.progress * 100).toInt()}%")
+                        }
+                    }
                     is ProcessingStatus.Complete -> {
+                        Log.d("MainContent", "Processing complete. Total frames: ${status.results.size}")
+                        Toast.makeText(context, "Processing complete!", Toast.LENGTH_SHORT).show()
                         processingResults = status.results
                         isProcessing = false
                         isPlaying = true
                     }
                     is ProcessingStatus.Error -> {
                         isProcessing = false
+                        Toast.makeText(context, "Processing failed: ${status.throwable.message}", Toast.LENGTH_LONG).show()
                         Log.e("MainContent", "Processing failed", status.throwable)
                     }
                 }
@@ -286,6 +306,7 @@ fun ControlBar(
     isRecording: Boolean,
     onRecordToggle: () -> Unit,
     hasVideo: Boolean,
+    isProcessing: Boolean,
     onProcess: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -295,7 +316,10 @@ fun ControlBar(
         verticalAlignment = Alignment.CenterVertically
     ) {
         if (hasVideo) {
-            Button(onClick = onProcess) {
+            Button(
+                onClick = onProcess,
+                enabled = !isProcessing // Disable during processing
+            ) {
                 Text("Process Last")
             }
         }
@@ -314,6 +338,7 @@ fun ControlBar(
 fun PlaybackView(
     videoUri: Uri,
     results: Map<Int, FrameResult>,
+    labels: List<String>,
     onClose: () -> Unit
 ) {
     val context = LocalContext.current
@@ -334,8 +359,20 @@ fun PlaybackView(
     LaunchedEffect(exoPlayer) {
         while (true) {
             val pos = exoPlayer.currentPosition
+            // Native fps is 30, but results might be sparse (15fps)
+            // Use round to nearest frame to avoid flickering
             val frameIndex = (pos / 1000f * 30).toInt()
-            currentFrameResult = results[frameIndex]
+            
+            // Search for the closest available frame result if sparse
+            val actualFrame = if (results.containsKey(frameIndex)) {
+                results[frameIndex]
+            } else if (results.containsKey(frameIndex - 1)) {
+                results[frameIndex - 1]
+            } else {
+                null
+            }
+            
+            currentFrameResult = actualFrame
             delay(16)
         }
     }
@@ -354,7 +391,7 @@ fun PlaybackView(
         
         DetectionOverlay(
             frameResult = currentFrameResult,
-            labels = Labels.P0,
+            labels = labels,
             modifier = Modifier.fillMaxSize(),
             scaleType = ViewportTransform.ScaleType.FIT_CENTER
         )

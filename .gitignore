@@ -11,6 +11,12 @@
 *.pyc
 __pycache__/
 
+# Model assets and weights
+*.pt
+*.onnx
+/out/
+/weights/
+
 # Artifacts and logs
 .artifacts/
 *.log

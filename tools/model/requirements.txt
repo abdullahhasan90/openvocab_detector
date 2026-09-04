@@ -1,0 +1,5 @@
+ultralytics>=8.2.0
+onnx>=1.14.0
+onnxsim>=0.4.0
+onnx2tf>=1.17.0
+tensorflow>=2.15.0

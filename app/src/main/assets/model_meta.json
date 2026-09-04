@@ -1,0 +1,7 @@
+{
+  "sha256": "c887dc8f9a1ace7c84d86f2c7b24a1fb15ae7368cb65c93ff9ae6f40f7002749",
+  "num_classes": 280,
+  "input_size": 640,
+  "generated_at": "2024-09-04",
+  "notes": "Exported WITH raw DFL and Scores. Manual decode required in Kotlin."
+}

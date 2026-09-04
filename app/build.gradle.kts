@@ -74,8 +74,12 @@ dependencies {
     // TFLite with exclusion to avoid conflict with LiteRT
     implementation(libs.tflite.task.vision) {
         exclude(group = "org.tensorflow", module = "tensorflow-lite-api")
+        exclude(group = "com.google.ai.edge.litert", module = "litert-api")
     }
-    implementation(libs.tflite.gpu)
+    implementation(libs.tflite.gpu) {
+        exclude(group = "org.tensorflow", module = "tensorflow-lite-api")
+        exclude(group = "com.google.ai.edge.litert", module = "litert-api")
+    }
 
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))

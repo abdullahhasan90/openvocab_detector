@@ -51,6 +51,9 @@ fun DetectionOverlay(
     Canvas(modifier = modifier.fillMaxSize()) {
         val viewWidth = size.width
         val viewHeight = size.height
+        
+        // Hard clip to view boundaries
+        drawContext.canvas.clipRect(0f, 0f, viewWidth, viewHeight)
 
         // Calculate transform once per frame
         val transform = ViewportTransform(
@@ -71,11 +74,20 @@ fun DetectionOverlay(
                 frameResult.sourceHeight
             )
             
+            // STRICT VIEW CLIPPING
+            val left = transformedRect.left.coerceIn(0f, viewWidth)
+            val top = transformedRect.top.coerceIn(0f, viewHeight)
+            val right = transformedRect.right.coerceIn(0f, viewWidth)
+            val bottom = transformedRect.bottom.coerceIn(0f, viewHeight)
+            
+            // Only draw if the clipped box is still valid
+            if (right <= left || bottom <= top) return@forEach
+
             // Draw Box
             drawRect(
                 color = color,
-                topLeft = Offset(transformedRect.left, transformedRect.top),
-                size = Size(transformedRect.width(), transformedRect.height()),
+                topLeft = Offset(left, top),
+                size = Size(right - left, bottom - top),
                 style = Stroke(width = strokeWidth)
             )
 
@@ -89,18 +101,21 @@ fun DetectionOverlay(
             val labelWidth = textBounds.width().toFloat() + 8f
             val labelHeight = textBounds.height().toFloat() + 4f
             
-            // Label Background (drawn above the box)
+            // Position label: above the box, but if too high, push inside the box
+            val labelTop = if (top - labelHeight < 0) top else top - labelHeight
+            
+            // Label Background
             drawRect(
                 color = color.copy(alpha = 0.7f),
-                topLeft = Offset(transformedRect.left, transformedRect.top - labelHeight),
+                topLeft = Offset(left, labelTop),
                 size = Size(labelWidth, labelHeight)
             )
             
             // Label Text
             drawContext.canvas.nativeCanvas.drawText(
                 fullLabel,
-                transformedRect.left + 4f,
-                transformedRect.top - 4f,
+                left + 4f,
+                labelTop + labelHeight - 4f, // Adjusted baseline for monospace
                 textPaint
             )
         }
