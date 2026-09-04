@@ -26,13 +26,6 @@ kotlin {
 
 dependencies {
     implementation(libs.androidx.core.ktx)
-    implementation(libs.tflite.task.vision) {
-        exclude(group = "org.tensorflow", module = "tensorflow-lite-api")
-        exclude(group = "com.google.ai.edge.litert", module = "litert-api")
-    }
-    implementation(libs.tflite.gpu) {
-        exclude(group = "org.tensorflow", module = "tensorflow-lite-api")
-        exclude(group = "com.google.ai.edge.litert", module = "litert-api")
-    }
     implementation("org.tensorflow:tensorflow-lite:2.16.1")
+    implementation("org.tensorflow:tensorflow-lite-gpu:2.16.1")
 }

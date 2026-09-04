@@ -107,19 +107,18 @@ fun MainContent() {
     var isPlaying by remember { mutableStateOf(false) }
 
     // ML & Media
-    val detector = remember { YoloWorldDetector(context) }
-    val videoProcessor = remember { VideoProcessor(detector) }
+    var detector by remember { mutableStateOf<Detector?>(null) }
+    val videoProcessor = remember(detector) { detector?.let { VideoProcessor(it) } }
     val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
     
     // Safety flag to stop live inference when processing/playing
-    // Use derivedStateOf and read .value in the analyzer to ensure fresh state
     val isAnalysisActive = remember { 
-        derivedStateOf { !isProcessing && !isPlaying } 
+        derivedStateOf { !isProcessing && !isPlaying && detector != null } 
     }
 
     DisposableEffect(Unit) {
         onDispose {
-            detector.close()
+            detector?.close()
             analysisExecutor.shutdown()
         }
     }
@@ -134,6 +133,22 @@ fun MainContent() {
     }
 
     LaunchedEffect(Unit) {
+        analysisExecutor.execute {
+            try {
+                Log.d("MainContent", "Initializing GPU Detector...")
+                detector = YoloWorldDetector(context, modelPath = "yoloworld_s_fp16.tflite", useGpu = true)
+                Log.d("MainContent", "GPU Detector ready.")
+            } catch (t: Throwable) {
+                Log.e("MainContent", "GPU Init failed, falling back to CPU", t)
+                try {
+                    detector = YoloWorldDetector(context, modelPath = "yoloworld_s_int8.tflite", useGpu = false)
+                    Log.d("MainContent", "CPU Detector ready.")
+                } catch (t2: Throwable) {
+                    Log.e("MainContent", "CPU Init failed as well", t2)
+                }
+            }
+        }
+
         val cameraProvider = ProcessCameraProvider.getInstance(context).get()
         val preview = Preview.Builder().build().also {
             it.surfaceProvider = previewView.surfaceProvider
@@ -143,16 +158,14 @@ fun MainContent() {
             .build()
             .also { analysis ->
                 analysis.setAnalyzer(analysisExecutor) { imageProxy ->
-                    if (!isAnalysisActive.value) {
+                    val currentDetector = detector
+                    if (!isAnalysisActive.value || currentDetector == null) {
                         imageProxy.close()
                         return@setAnalyzer
                     }
 
                     try {
-                        // Use official ImageProxy.toBitmap() - Handles basic YUV conversion
                         val bitmap = imageProxy.toBitmap()
-                        
-                        // Rotate bitmap correctly for the model
                         val rotation = imageProxy.imageInfo.rotationDegrees
                         val rotatedBitmap = if (rotation != 0) {
                             val matrix = Matrix().apply { postRotate(rotation.toFloat()) }
@@ -161,7 +174,7 @@ fun MainContent() {
                             bitmap
                         }
 
-                        frameResult = detector.detect(DetectorInput.Bmp(rotatedBitmap))
+                        frameResult = currentDetector.detect(DetectorInput.Bmp(rotatedBitmap))
                     } catch (e: Exception) {
                         Log.e("CameraScreen", "Detection failed", e)
                     } finally {
@@ -192,7 +205,7 @@ fun MainContent() {
                 PlaybackView(
                     videoUri = lastVideoUri!!,
                     results = processingResults!!,
-                    labels = detector.labels,
+                    labels = detector?.labels ?: emptyList(),
                     onClose = { isPlaying = false }
                 )
             } else {
@@ -200,7 +213,7 @@ fun MainContent() {
                 
                 DetectionOverlay(
                     frameResult = frameResult,
-                    labels = detector.labels,
+                    labels = detector?.labels ?: emptyList(),
                     modifier = Modifier.fillMaxSize()
                 )
 
@@ -243,7 +256,7 @@ fun MainContent() {
                         if (lastVideoUri != null && !isProcessing) {
                             Log.d("MainContent", "Starting video processing for: $lastVideoUri")
                             Toast.makeText(context, "Processing started...", Toast.LENGTH_SHORT).show()
-                            frameResult = null // Clear live boxes immediately
+                            frameResult = null
                             processingResults = null
                             processingProgress = 0f
                             isProcessing = true
@@ -252,7 +265,6 @@ fun MainContent() {
                     modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 32.dp)
                 )
 
-                // Processing UI
                 if (isProcessing) {
                     Box(
                         modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.5f)),
@@ -269,22 +281,16 @@ fun MainContent() {
         }
     }
     
-    // Processing trigger
     LaunchedEffect(isProcessing) {
         if (isProcessing && lastVideoUri != null) {
-            // Wait for the video file to be finalized by the OS
+            val processor = videoProcessor ?: return@LaunchedEffect
             delay(500)
-            
-            videoProcessor.processVideo(context, lastVideoUri!!).collect { status ->
+            processor.processVideo(context, lastVideoUri!!).collect { status ->
                 when (status) {
                     is ProcessingStatus.Progress -> {
                         processingProgress = status.progress
-                        if (((status.progress * 100).toInt() % 10) == 0) {
-                            Log.d("MainContent", "Processing progress: ${(status.progress * 100).toInt()}%")
-                        }
                     }
                     is ProcessingStatus.Complete -> {
-                        Log.d("MainContent", "Processing complete. Total frames: ${status.results.size}")
                         Toast.makeText(context, "Processing complete!", Toast.LENGTH_SHORT).show()
                         processingResults = status.results
                         isProcessing = false
@@ -318,7 +324,7 @@ fun ControlBar(
         if (hasVideo) {
             Button(
                 onClick = onProcess,
-                enabled = !isProcessing // Disable during processing
+                enabled = !isProcessing
             ) {
                 Text("Process Last")
             }
@@ -328,7 +334,6 @@ fun ControlBar(
             onClick = onRecordToggle,
             modifier = Modifier.size(72.dp).background(if (isRecording) Color.Red else Color.White, CircleShape)
         ) {
-            // Record circle
         }
     }
 }
@@ -359,11 +364,8 @@ fun PlaybackView(
     LaunchedEffect(exoPlayer) {
         while (true) {
             val pos = exoPlayer.currentPosition
-            // Native fps is 30, but results might be sparse (15fps)
-            // Use round to nearest frame to avoid flickering
             val frameIndex = (pos / 1000f * 30).toInt()
             
-            // Search for the closest available frame result if sparse
             val actualFrame = if (results.containsKey(frameIndex)) {
                 results[frameIndex]
             } else if (results.containsKey(frameIndex - 1)) {

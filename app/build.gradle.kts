@@ -70,16 +70,10 @@ dependencies {
     // Media3
     implementation(libs.androidx.media3.exoplayer)
     implementation(libs.androidx.media3.ui)
+    implementation(libs.androidx.media3.common)
 
-    // TFLite with exclusion to avoid conflict with LiteRT
-    implementation(libs.tflite.task.vision) {
-        exclude(group = "org.tensorflow", module = "tensorflow-lite-api")
-        exclude(group = "com.google.ai.edge.litert", module = "litert-api")
-    }
-    implementation(libs.tflite.gpu) {
-        exclude(group = "org.tensorflow", module = "tensorflow-lite-api")
-        exclude(group = "com.google.ai.edge.litert", module = "litert-api")
-    }
+    // TFLite
+    implementation(libs.tensorflow.lite)
 
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))
