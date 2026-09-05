@@ -28,4 +28,8 @@ kotlin {
 dependencies {
     implementation(project(":detection"))
     implementation(libs.androidx.core.ktx)
+    implementation(libs.gson)
+    implementation(libs.androidx.media3.transformer)
+    implementation(libs.androidx.media3.effect)
+    implementation(libs.androidx.media3.common)
 }
