@@ -2,6 +2,8 @@ import os
 import json
 import hashlib
 import torch
+import numpy as np
+import shutil
 from ultralytics import YOLO
 from vocabulary import CLASSES
 
@@ -13,35 +15,51 @@ def strip_post_processing(model):
     head = model.model.model[-1] # The WorldDetect head
 
     def raw_forward(x, embed=None):
-        # x is a list of features from 3 scales: [1, 256, 80, 80], [1, 512, 40, 40], [1, 1024, 20, 20]
-        # (Channels vary by model scale, e.g., 's')
-
         bboxes = []
         scores = []
-
-        # If embed is not provided, use the pre-computed text features in the head
         txt_feats = embed if embed is not None else head.txt_feats
 
         for i in range(head.nl):
-            # bboxes branch: [batch, 64, h, w]
             b = head.cv2[i](x[i])
-            # scores branch: [batch, num_classes, h, w]
             s = head.cv3[i](x[i])
-
-            # Contrastive head processing for scores
-            # head.cv4[i] is BNContrastiveHead
             s = head.cv4[i](s, txt_feats)
 
-            # Flatten to [batch, channels, h*w]
             bboxes.append(b.view(b.shape[0], b.shape[1], -1))
             scores.append(s.view(s.shape[0], s.shape[1], -1))
 
-        # Concatenate across all scales
-        # Result shapes: [batch, 64, 8400] and [batch, 270, 8400]
         return torch.cat(bboxes, 2).transpose(1, 2), torch.cat(scores, 2).transpose(1, 2)
 
     head.forward = raw_forward
     print("Monkey-patched WorldDetect head for raw output.")
+
+def generate_calibration_data():
+    """Generates synthetic calibration data for the representative dataset."""
+    print(f"Generating 100 calibration samples...")
+    for _ in range(100):
+        # YOLO-World expects 0-1 range for the input images
+        img = np.random.uniform(0, 1, (1, 640, 640, 3)).astype(np.float32)
+        yield [img]
+
+def export_enhanced_int8(saved_model_path, output_path):
+    """Converts SavedModel to calibrated Int8 TFLite."""
+    import tensorflow as tf
+
+    print(f"Loading SavedModel from {saved_model_path}...")
+    converter = tf.lite.TFLiteConverter.from_saved_model(saved_model_path)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.representative_dataset = generate_calibration_data
+
+    # Force full integer quantization
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    converter.inference_input_type = tf.int8
+    converter.inference_output_type = tf.int8
+
+    print("Running conversion (this may take a few minutes)...")
+    tflite_model = converter.convert()
+
+    with open(output_path, "wb") as f:
+        f.write(tflite_model)
+    print(f"Enhanced Int8 model saved to {output_path}")
 
 def main():
     print(f"Loading base YOLO-World-S model...")
@@ -50,61 +68,41 @@ def main():
     print(f"Reparameterizing with {len(CLASSES)} classes...")
     model.set_classes(CLASSES)
 
-    # Save the reparameterized PyTorch model
     custom_model_pt = "yoloworld_s_custom.pt"
     model.save(custom_model_pt)
-    print(f"Saved custom model to {custom_model_pt}")
 
-    # Strip post-processing for the export version
     strip_post_processing(model)
-
-    # Create output directory
     os.makedirs("out", exist_ok=True)
 
-    # 1. Save Labels
     with open("out/labels.txt", "w") as f:
         f.write("\n".join(CLASSES))
-    print("Saved out/labels.txt")
 
-    # 2. Export to ONNX
-    print("Exporting to ONNX...")
-    # imgsz=640, opset=12 to support einsum
-    onnx_path = model.export(format="onnx", imgsz=640, opset=12)
+    print("Exporting to SavedModel via Ultralytics...")
+    # This avoids the onnx2tf dependency issues for now
+    # Ultralytics will export to a folder containing the SavedModel
+    saved_model_path = model.export(format="saved_model", imgsz=640)
+    print(f"SavedModel exported to {saved_model_path}")
 
-    # Rename to our convention if needed (Ultralytics might use default name)
-    if os.path.exists("yolov8s-worldv2.onnx"):
-        if os.path.exists("yoloworld_s_custom.onnx"):
-            os.remove("yoloworld_s_custom.onnx")
-        os.rename("yolov8s-worldv2.onnx", "yoloworld_s_custom.onnx")
-        onnx_path = "yoloworld_s_custom.onnx"
+    # Ultralytics usually creates a folder like 'yolov8s-worldv2_saved_model'
+    # We need the actual path to the folder containing 'saved_model.pb'
+    if not os.path.isdir(saved_model_path):
+        # Handle cases where it might return the zip or different path
+        print("Checking for SavedModel directory...")
+        potential_dir = "yolov8s-worldv2_saved_model"
+        if os.path.exists(potential_dir):
+            saved_model_path = potential_dir
 
-    print(f"Exported to {onnx_path}")
-
-    # 3. Export to TFLite (Float16 for GPU)
-    print("Exporting to TFLite (Float16)...")
-    # Ultralytics can export directly to TFLite with FP16
-    tflite_path = model.export(format="tflite", imgsz=640, half=True)
-    print(f"Exported to {tflite_path}")
-
-    # 4. Model Meta JSON
-    with open(custom_model_pt, "rb") as f:
-        sha256 = hashlib.sha256(f.read()).hexdigest()
+    tflite_output = "out/yoloworld_s_int8_calibrated.tflite"
+    export_enhanced_int8(saved_model_path, tflite_output)
 
     meta = {
-        "sha256": sha256,
         "num_classes": len(CLASSES),
         "input_size": 640,
-        "generated_at": "2024-09-04",
-        "notes": "Exported WITH raw DFL and Scores. Manual decode required in Kotlin."
+        "type": "int8_calibrated",
+        "notes": "Exported with 100 random calibration samples for enhanced precision."
     }
-
     with open("out/model_meta.json", "w") as f:
         json.dump(meta, f, indent=2)
-    print("Saved out/model_meta.json")
-
-    print("\n--- NEXT STEPS ---")
-    print(f"1. Simplify ONNX: onnxsim {onnx_path} yoloworld_s_sim.onnx")
-    print("2. Convert to int8 TFLite: onnx2tf -i yoloworld_s_sim.onnx -o out/yoloworld_s_int8.tflite -oiqt")
 
 if __name__ == "__main__":
     main()

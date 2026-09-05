@@ -72,8 +72,8 @@ dependencies {
     implementation(libs.androidx.media3.ui)
     implementation(libs.androidx.media3.common)
 
-    // TFLite
-    implementation(libs.tensorflow.lite)
+    // TFLite (Base only in app)
+    implementation("org.tensorflow:tensorflow-lite:2.16.1")
 
     testImplementation(libs.junit)
     androidTestImplementation(platform(libs.androidx.compose.bom))

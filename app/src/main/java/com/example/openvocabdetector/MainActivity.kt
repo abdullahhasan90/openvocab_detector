@@ -135,16 +135,16 @@ fun MainContent() {
     LaunchedEffect(Unit) {
         analysisExecutor.execute {
             try {
-                Log.d("MainContent", "Initializing GPU Detector...")
-                detector = YoloWorldDetector(context, modelPath = "yoloworld_s_fp16.tflite", useGpu = true)
-                Log.d("MainContent", "GPU Detector ready.")
+                // SMARTER INT8 PATH: Calibrated model for high sensitivity + XNNPACK speed
+                Log.d("MainContent", "Initializing Calibrated Int8 Detector...")
+                detector = YoloWorldDetector(context, modelPath = "yoloworld_s_int8_calibrated.tflite", useGpu = false)
+                Log.d("MainContent", "Calibrated Detector ready.")
             } catch (t: Throwable) {
-                Log.e("MainContent", "GPU Init failed, falling back to CPU", t)
+                Log.e("MainContent", "Init failed, falling back to basic Int8", t)
                 try {
                     detector = YoloWorldDetector(context, modelPath = "yoloworld_s_int8.tflite", useGpu = false)
-                    Log.d("MainContent", "CPU Detector ready.")
                 } catch (t2: Throwable) {
-                    Log.e("MainContent", "CPU Init failed as well", t2)
+                    Log.e("MainContent", "Total Init Failure", t2)
                 }
             }
         }

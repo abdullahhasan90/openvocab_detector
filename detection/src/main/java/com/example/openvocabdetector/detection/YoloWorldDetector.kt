@@ -13,11 +13,12 @@ import java.nio.ByteOrder
 import java.io.FileInputStream
 import java.nio.channels.FileChannel
 import kotlin.math.exp
+import kotlin.math.ln
 
 class YoloWorldDetector(
     context: Context,
     modelPath: String = "yoloworld_s_int8.tflite",
-    private val scoreThreshold: Float = 0.15f,
+    private val scoreThreshold: Float = 0.18f,
     private val nmsThreshold: Float = 0.5f,
     useGpu: Boolean = false
 ) : Detector {
@@ -34,14 +35,24 @@ class YoloWorldDetector(
 
     private val anchors: List<Anchor>
 
-    // Reusable buffers
+    // Reusable buffers and arrays for BULK tensor access
     private val inputBuffer: ByteBuffer
     private val scoreOutput: ByteBuffer
     private val bboxOutput: ByteBuffer
     private val intValues: IntArray
+    
+    private val scoreArrayFloat: FloatArray?
+    private val scoreArrayByte: ByteArray?
+    private val bboxArrayFloat: FloatArray?
+    private val bboxArrayByte: ByteArray?
+    
+    private val inputFloats: FloatArray?
+    private val inputBytes: ByteArray?
+
+    // Optimization constants
+    private val logitThreshold: Float = -ln(1.0f / scoreThreshold - 1.0f)
 
     init {
-        // Load Model
         val assetFileDescriptor = context.assets.openFd(modelPath)
         val mappedByteBuffer = FileInputStream(assetFileDescriptor.fileDescriptor).channel.map(
             FileChannel.MapMode.READ_ONLY, 
@@ -50,19 +61,25 @@ class YoloWorldDetector(
         )
         
         val options = Interpreter.Options().apply {
-            if (useGpu) {
+            setUseXNNPACK(true)
+            setNumThreads(4)
+            
+            if (useGpu) { 
                 try {
-                    gpuDelegate = GpuDelegate()
+                    val gpuOptions = GpuDelegate.Options().apply {
+                        this.isPrecisionLossAllowed = true
+                        this.inferencePreference = GpuDelegate.Options.INFERENCE_PREFERENCE_FAST_SINGLE_ANSWER
+                    }
+                    gpuDelegate = GpuDelegate(gpuOptions)
                     addDelegate(gpuDelegate)
                     Log.d("YoloWorld", "GPU delegate enabled")
                 } catch (t: Throwable) {
-                    Log.e("YoloWorld", "GPU Init failed", t)
-                    setNumThreads(4)
+                    Log.e("YoloWorld", "GPU Init failed fallback to CPU", t)
                 }
-            } else {
-                setNumThreads(4)
             }
         }
+        
+        Log.d("YoloWorld", "Initializing Hybrid Path (Model: $modelPath, Engine: XNNPACK)")
         
         try {
             interpreter = Interpreter(mappedByteBuffer, options)
@@ -71,11 +88,9 @@ class YoloWorldDetector(
             throw t
         }
 
-        // Model inspection
         val inputTensor = interpreter.getInputTensor(0)
         isFloatModel = inputTensor.dataType() == DataType.FLOAT32
         
-        // Find output indices by shape (Score: [1, 8400, 280], BBox: [1, 8400, 64])
         val out0 = interpreter.getOutputTensor(0)
         if (out0.shape()[2] == 64) {
             bboxTensorIndex = 0
@@ -88,7 +103,6 @@ class YoloWorldDetector(
         numModelClasses = interpreter.getOutputTensor(scoreTensorIndex).shape()[2]
         labels = context.assets.open("labels.txt").bufferedReader().readLines()
 
-        // Precompute Anchors
         val mutableAnchors = mutableListOf<Anchor>()
         for (stride in listOf(8, 16, 32)) {
             val gridSide = inputSize / stride
@@ -100,88 +114,131 @@ class YoloWorldDetector(
         }
         anchors = mutableAnchors
 
-        // Allocate buffers based on data type
         val bytesPerValue = if (isFloatModel) 4 else 1
-        inputBuffer = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * bytesPerValue).apply { 
+        inputBuffer = ByteBuffer.allocateDirect(inputSize * inputSize * 3 * bytesPerValue).apply { 
             order(ByteOrder.nativeOrder()) 
         }
-        scoreOutput = ByteBuffer.allocateDirect(1 * 8400 * numModelClasses * bytesPerValue).apply { 
+        scoreOutput = ByteBuffer.allocateDirect(8400 * numModelClasses * bytesPerValue).apply { 
             order(ByteOrder.nativeOrder()) 
         }
-        bboxOutput = ByteBuffer.allocateDirect(1 * 8400 * 64 * bytesPerValue).apply { 
+        bboxOutput = ByteBuffer.allocateDirect(8400 * 64 * bytesPerValue).apply { 
             order(ByteOrder.nativeOrder()) 
         }
         intValues = IntArray(inputSize * inputSize)
+
+        if (isFloatModel) {
+            scoreArrayFloat = FloatArray(8400 * numModelClasses)
+            bboxArrayFloat = FloatArray(8400 * 64)
+            scoreArrayByte = null
+            bboxArrayByte = null
+            inputFloats = FloatArray(inputSize * inputSize * 3)
+            inputBytes = null
+        } else {
+            scoreArrayFloat = null
+            bboxArrayFloat = null
+            scoreArrayByte = ByteArray(8400 * numModelClasses)
+            bboxArrayByte = ByteArray(8400 * 64)
+            inputFloats = null
+            inputBytes = ByteArray(inputSize * inputSize * 3)
+        }
     }
 
     override fun detect(input: DetectorInput): FrameResult = synchronized(this) {
-        val startTime = SystemClock.uptimeMillis()
+        val overallStartTime = SystemClock.uptimeMillis()
         val bitmap = (input as? DetectorInput.Bmp)?.bitmap ?: throw IllegalArgumentException("Requires Bmp")
 
         // 1. Preprocess
+        val preprocessStart = SystemClock.uptimeMillis()
         val scaledBitmap = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
-        inputBuffer.rewind()
         scaledBitmap.getPixels(intValues, 0, scaledBitmap.width, 0, 0, scaledBitmap.width, scaledBitmap.height)
         
-        for (pixel in intValues) {
-            val r = (pixel shr 16) and 0xFF
-            val g = (pixel shr 8) and 0xFF
-            val b = pixel and 0xFF
-            if (isFloatModel) {
-                inputBuffer.putFloat(r / 255.0f)
-                inputBuffer.putFloat(g / 255.0f)
-                inputBuffer.putFloat(b / 255.0f)
-            } else {
-                inputBuffer.put((r - 128).toByte())
-                inputBuffer.put((g - 128).toByte())
-                inputBuffer.put((b - 128).toByte())
+        if (isFloatModel) {
+            val floats = inputFloats!!
+            val inv255 = 1.0f / 255.0f
+            for (i in intValues.indices) {
+                val pixel = intValues[i]
+                floats[i * 3] = ((pixel shr 16) and 0xFF) * inv255
+                floats[i * 3 + 1] = ((pixel shr 8) and 0xFF) * inv255
+                floats[i * 3 + 2] = (pixel and 0xFF) * inv255
             }
+            inputBuffer.rewind()
+            inputBuffer.asFloatBuffer().put(floats)
+        } else {
+            val bytes = inputBytes!!
+            for (i in intValues.indices) {
+                val pixel = intValues[i]
+                bytes[i * 3] = (((pixel shr 16) and 0xFF) - 128).toByte()
+                bytes[i * 3 + 1] = (((pixel shr 8) and 0xFF) - 128).toByte()
+                bytes[i * 3 + 2] = ((pixel and 0xFF) - 128).toByte()
+            }
+            inputBuffer.rewind()
+            inputBuffer.put(bytes)
         }
         if (scaledBitmap != bitmap) scaledBitmap.recycle()
+        val preprocessTime = SystemClock.uptimeMillis() - preprocessStart
 
         // 2. Inference
+        val inferenceStart = SystemClock.uptimeMillis()
         scoreOutput.rewind()
         bboxOutput.rewind()
         interpreter.runForMultipleInputsOutputs(
             arrayOf(inputBuffer), 
             mapOf(scoreTensorIndex to scoreOutput, bboxTensorIndex to bboxOutput)
         )
+        val inferenceTime = SystemClock.uptimeMillis() - inferenceStart
 
-        // 3. Decode
+        // 3. Post-process (Decoding)
+        val decodeStart = SystemClock.uptimeMillis()
+        scoreOutput.rewind()
+        bboxOutput.rewind()
+        if (isFloatModel) {
+            scoreOutput.asFloatBuffer().get(scoreArrayFloat!!)
+            bboxOutput.asFloatBuffer().get(bboxArrayFloat!!)
+        } else {
+            scoreOutput.get(scoreArrayByte!!)
+            bboxOutput.get(bboxArrayByte!!)
+        }
+
         val scoreQP = interpreter.getOutputTensor(scoreTensorIndex).quantizationParams()
         val bboxQP = interpreter.getOutputTensor(bboxTensorIndex).quantizationParams()
+        val labelsCount = labels.size
 
         val rawDetections = mutableListOf<Detection>()
-        scoreOutput.rewind()
-
+        
         for (i in 0 until 8400) {
-            var maxScore = -100f
+            var maxRaw = if (isFloatModel) -100f else -128f
             var classIdx = -1
+            val offset = i * numModelClasses
             
-            for (c in 0 until numModelClasses) {
-                val score = if (isFloatModel) {
-                    scoreOutput.getFloat()
+            // Loop optimized: Move labelsCount check outside inner loop logic if possible
+            // Actually, we must check labelsCount to avoid out of bounds in our label list
+            for (c in 0 until labelsCount) {
+                val s = if (isFloatModel) {
+                    scoreArrayFloat!![offset + c]
                 } else {
-                    (scoreOutput.get().toInt() - scoreQP.zeroPoint) * scoreQP.scale
+                    (scoreArrayByte!![offset + c].toInt() - scoreQP.zeroPoint) * scoreQP.scale
                 }
                 
-                if (c < labels.size && score > maxScore) {
-                    maxScore = score
+                if (s > maxRaw) {
+                    maxRaw = s
                     classIdx = c
                 }
             }
             
-            val finalScore = 1.0f / (1.0f + exp(-maxScore))
-            if (finalScore >= scoreThreshold) {
+            // Check against logit threshold to skip sigmoid/bbox math for 99% of locations
+            if (maxRaw >= logitThreshold) {
+                val finalScore = 1.0f / (1.0f + exp(-maxRaw))
+                
                 val dists = FloatArray(4) { side ->
                     var sum = 0.0
+                    val sideOffset = i * 64 + side * 16
                     val bins = DoubleArray(16) { bin ->
-                        val raw = if (isFloatModel) {
-                            bboxOutput.getFloat((i * 64 + side * 16 + bin) * 4)
+                        val rawVal = if (isFloatModel) {
+                            bboxArrayFloat!![sideOffset + bin]
                         } else {
-                            (bboxOutput.get(i * 64 + side * 16 + bin).toInt() - bboxQP.zeroPoint) * bboxQP.scale
+                            (bboxArrayByte!![sideOffset + bin].toInt() - bboxQP.zeroPoint) * bboxQP.scale
                         }
-                        val e = exp(raw.toDouble())
+                        val e = exp(rawVal.toDouble())
                         sum += e
                         e
                     }
@@ -203,8 +260,20 @@ class YoloWorldDetector(
             }
         }
 
-        val finalDetections = applyNms(rawDetections).take(80)
-        FrameResult(finalDetections, bitmap.width, bitmap.height, SystemClock.uptimeMillis() - startTime)
+        // Cap raw detections before NMS to avoid O(N^2) explosion
+        val cappedRaw = if (rawDetections.size > 300) {
+            rawDetections.sortedByDescending { it.score }.take(300)
+        } else {
+            rawDetections
+        }
+        
+        val finalDetections = applyNms(cappedRaw).take(80)
+        val decodeTime = SystemClock.uptimeMillis() - decodeStart
+        val totalTime = SystemClock.uptimeMillis() - overallStartTime
+
+        Log.d("YoloWorld", "Perf: Total=${totalTime}ms (Pre=${preprocessTime}ms, Inf=${inferenceTime}ms, Dec=${decodeTime}ms) RawCount=${rawDetections.size}")
+
+        return FrameResult(finalDetections, bitmap.width, bitmap.height, totalTime)
     }
 
     private fun applyNms(detections: List<Detection>): List<Detection> {
